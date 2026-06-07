@@ -1,7 +1,8 @@
 import { eq, ilike } from "drizzle-orm";
-import { db } from "./db";
-import { todosTable } from "./db/schema";
+import { db } from "./db/index.js";
+import { todosTable } from "./db/schema.js";
 import { GoogleGenAI } from "@google/genai";
+import readlineSync from "readline-sync";
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -13,110 +14,131 @@ async function getAllTodos() {
 }
 
 async function createTodo(todo) {
-  await db.insert(todosTable).values({
-    todo,
-  });
+  const result = await db.insert(todosTable).values({ todo }).returning();
+  return result;
 }
 
-async function searchTodo(search) {
+async function searchTodo(query) {
   const todo = await db
     .select()
     .from(todosTable)
-    .where(ilike(todosTable.todo, search));
+    .where(ilike(todosTable.todo, `%${query}%`));
   return todo;
 }
 
 async function deleteTodoById(id) {
-  await db.delete(todosTable).where(eq(todosTable.id, id));
+  const result = await db
+    .delete(todosTable)
+    .where(eq(todosTable.id, id))
+    .returning();
+  return result;
 }
 
+const tools = {
+  getAllTodos,
+  createTodo,
+  searchTodo,
+  deleteTodoById,
+};
 
 const SYSTEM_PROMPT = `
-You are an AI agent connected to a PostgreSQL database through Drizzle ORM and equipped with tools to manage a TODO application.
+You are an AI TODO list assistant with START PLAN ACTION Observation and Output state.
+Wait for the user prompt and first plan with available tools.
+After planning, Take a action with appropiate tools and wait for observation based on Action.
+Once you get the observation,Return the AI Response based on START prompt and observation.
 
-Your job is to understand user requests and decide whether to:
-1. Fetch data from the database
-2. Create new todos
-3. Search existing todos
-4. Delete todos
-5. Or respond conversationally when no tool is needed
+you can manage task by adding viewing updating and deleting them.
+You must strictly follow the JSON output format.
 
-You must always prefer using tools for any database-related operation instead of guessing or hallucinating data.
+TODO Db Schema :
+id:Int and primary key,
+todo :String,
+created_At:Date Time,
+updated_At:Date Time,
 
----
+Available Tools: - 
+-getAllTodos() : Return all the Todos from the database,
+-createTodo(todo:string) : Create a new todo in Database take a todo as a string and return,
+-deleteTodoById(id:string) : Delete todo from database by ID given in db (primary key)
+-SearchTodo(query:string) : searches all todos in db and return the one which matches the given query using iLike() in dB
 
-AVAILABLE TOOLS:
-
-### 1. getAllTodos()
-- Description: Fetches all todos from the database.
-- Use when: User asks for all todos, list todos, show tasks, or "what do I have to do?"
-- Example:
-  User: "Show me all my todos"
-  Action: getAllTodos()
-
----
-
-### 2. createTodo(todo: string)
-- Description: Creates a new todo in the database.
-- Input:
-  - todo (string): The task to store
-- Use when: User wants to add/create a task
-- Example:
-  User: "Add buy milk to my list"
-  Action: createTodo("buy milk")
-
----
-
-### 3. searchTodo(search: string)
-- Description: Searches todos using case-insensitive partial match.
-- Implementation uses SQL ilike.
-- Use when: User asks to find, search, or filter tasks
-- Example:
-  User: "Find todos related to gym"
-  Action: searchTodo("%gym%")
-
----
-
-### 4. deleteTodoById(id: number)
-- Description: Deletes a todo by its unique ID.
-- Use when: User wants to delete/remove a specific task
-- Example:
-  User: "Delete todo with id 3"
-  Action: deleteTodoById(3)
-
----
-
-DATABASE RULES:
-- Always assume the database is the source of truth
-- Never invent todos
-- Always call a tool when data is required
-
----
-
-BEHAVIOR RULES:
-- Be concise and helpful
-- If user intent is unclear, ask a clarification question
-- If multiple actions are possible, choose the most relevant one or ask for confirmation
-- After tool execution, summarize the result in simple language
-
----
-
-EXAMPLES:
-
-User: "What are my todos?"
-→ getAllTodos()
-
-User: "Add finish homework"
-→ createTodo("finish homework")
-
-User: "Remove todo 5"
-→ deleteTodoById(5)
-
-User: "Do I have anything about study?"
-→ searchTodo("%study%")
-
----
-
-You are not just a chatbot — you are an agent that can take actions using tools and interact with a real database.
+Example: - 
+START 
+{ "type": "user", "user": "Add a task for shopping groceries." }
+{ "type": "plan", "plan": "I will try to get more context on what user needs to shop." }
+{ "type": "output", "output": "Can you tell me what all items you want to shop for?" }
+{ "type": "user", "user": "I want to shop for milk, kurkure, lays and choco." }
+{ "type": "plan", "plan": "I will use createTodo to create a new Todo in DB." }
+{ "type": "action", "function": "createTodo", "input": "Shopping for milk, kurkure, lays and choco." }
+{ "type": "observation", "observation": "2" }
+{ "type": "output", "output": "Your todo has been added successfully." }
 `;
 
+const messages = [
+  {
+    role: "user",
+    parts: [{ text: SYSTEM_PROMPT }],
+  },
+];
+
+while (true) {
+  const query = readlineSync.question(">> ");
+
+  messages.push({
+    role: "user",
+    parts: [{ text: query }],
+  });
+
+  while (true) {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: messages,
+    });
+
+    let text = response?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) break;
+
+    text = text
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+    let action;
+
+    try {
+      action = JSON.parse(text);
+    } catch {
+      break;
+    }
+
+    messages.push({
+      role: "model",
+      parts: [{ text }],
+    });
+
+    if (action.type === "output") {
+      console.log("🤖:", action.output);
+      break;
+    }
+
+    if (action.type === "action") {
+      const fn = tools[action.function];
+      if (!fn) throw new Error("Invalid tool: " + action.function);
+
+      const observation = await fn(action.input);
+
+      messages.push({
+        role: "user",
+        parts: [
+          {
+            text: JSON.stringify({
+              type: "observation",
+              observation,
+            }),
+          },
+        ],
+      });
+    }
+  }
+}
